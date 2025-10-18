@@ -24,3 +24,8 @@ rich
 questionary
 langchain_anthropic
 langchain-google-genai
+fastapi
+pydantic
+aiosqlite
+asyncio
+pandas_market_calendars
