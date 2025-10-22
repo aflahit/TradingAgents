@@ -28,6 +28,7 @@ import os, json, time, uuid, asyncio
 from dataclasses import dataclass, asdict, field
 from typing import Optional, Dict, Any, List
 from datetime import datetime, timezone, date
+import threading
 
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
@@ -98,7 +99,7 @@ class StatusResponse(BaseModel):
     error: Optional[str]
 
 # ---------------- Globals ----------------
-redis: aioredis.Redis
+redis_api: aioredis.Redis  # API loop client (used by endpoints & retention loop)
 
 # ---------------- DB (SQLite) ----------------
 async def init_db():
@@ -255,18 +256,18 @@ def _job_hash_key(job_id: str) -> str:
 def _job_done_channel(job_id: str) -> str:
     return KEY_JOB_DONE_CH.format(job_id=job_id)
 
-async def write_job(job: Job):
+async def write_job(job: Job, r: aioredis.Redis | None = None):
+    r = r or redis_api
     key = _job_hash_key(job.id)
     payload = asdict(job).copy()
-    # Serialize result
     if payload.get("result") is not None:
         payload["result"] = json.dumps(payload["result"])
-    # Cast None -> "" for Redis hash
     payload = {k: ("" if v is None else str(v)) for k, v in payload.items()}
-    await redis.hset(key, mapping=payload)
+    await r.hset(key, mapping=payload)
 
-async def read_job(job_id: str) -> Job:
-    data = await redis.hgetall(_job_hash_key(job_id))
+async def read_job(job_id: str, r: aioredis.Redis | None = None) -> Job:
+    r = r or redis_api
+    data = await r.hgetall(_job_hash_key(job_id))
     if not data:
         raise HTTPException(404, "job not found")
     def ff(x: Optional[str], default=None, cast=float):
@@ -294,23 +295,26 @@ async def read_job(job_id: str) -> Job:
         error=(data.get("error") or None),
     )
 
-async def queue_position(job_id: str) -> int:
-    lst = await redis.lrange(KEY_QUEUE_ORDER_L, 0, -1)
+async def queue_position(job_id: str, r: aioredis.Redis | None = None) -> int:
+    r = r or redis_api
+    lst = await r.lrange(KEY_QUEUE_ORDER_L, 0, -1)
     try:
         return lst.index(job_id) + 1
     except ValueError:
         return 0
 
-async def current_queue_size() -> int:
-    return await redis.llen(KEY_QUEUE_ORDER_L)
+async def current_queue_size(r: aioredis.Redis | None = None) -> int:
+    r = r or redis_api
+    return await r.llen(KEY_QUEUE_ORDER_L)
 
 # ---------------- Enqueue (single-flight) ----------------
-async def enqueue_or_join(ticker: str) -> Job:
+async def enqueue_or_join(ticker: str, r: aioredis.Redis) -> Job:
+    r = r or redis_api
     ticker = ticker.upper().strip()
     if not ticker:
         raise HTTPException(400, "ticker is required")
 
-    existing = await redis.get(_ticker_key(ticker))
+    existing = await r.get(_ticker_key(ticker))
     if existing:
         return await read_job(existing)
 
@@ -319,10 +323,10 @@ async def enqueue_or_join(ticker: str) -> Job:
     await write_job(job)
 
     # Map ticker->job (set TTL > max runtime; worker refreshes)
-    await redis.set(_ticker_key(ticker), job_id, nx=True, ex=60 * 10)
+    await r.set(_ticker_key(ticker), job_id, nx=True, ex=60 * 10)
 
     # Enqueue FIFO and visible order list
-    async with redis.pipeline(transaction=True) as p:
+    async with r.pipeline(transaction=True) as p:
         p.rpush(KEY_QUEUE_L, job_id)
         p.rpush(KEY_QUEUE_ORDER_L, job_id)
         await p.execute()
@@ -330,61 +334,70 @@ async def enqueue_or_join(ticker: str) -> Job:
 
 # ---------------- Worker loop (global concurrency=1) ----------------
 async def worker_loop():
-    while True:
-        try:
-            item = await redis.blpop(KEY_QUEUE_L, timeout=5)
-            if not item:
-                await asyncio.sleep(0.1)
-                continue
-            _, job_id = item
-
-            job = await read_job(job_id)
-            job.status = "running"
-            job.started_at = time.time()
-            await write_job(job)
-            await redis.lrem(KEY_QUEUE_ORDER_L, 0, job_id)
-
-            # Acquire global distributed lock
-            lock_id = uuid.uuid4().hex
-            got_lock = await redis.set(KEY_CONCURRENCY_LOCK, lock_id, nx=True, px=CONCURRENCY_TTL_MS)
-            while not got_lock:
-                await asyncio.sleep(0.5)
-                got_lock = await redis.set(KEY_CONCURRENCY_LOCK, lock_id, nx=True, px=CONCURRENCY_TTL_MS)
-
-            # Renew lock while executing
-            async def renew_lock():
-                while True:
-                    await asyncio.sleep(10)
-                    if (await redis.get(KEY_CONCURRENCY_LOCK)) != lock_id:
-                        break
-                    await redis.pexpire(KEY_CONCURRENCY_LOCK, CONCURRENCY_TTL_MS)
-
-            renew_task = asyncio.create_task(renew_lock(), name=f"renew-lock-{job_id}")
+    # Worker runs in its own thread/event loop — create a loop-local Redis client
+    r = aioredis.from_url(REDIS_URL, decode_responses=True)
+    try:
+        while True:
             try:
-                job.result = await analyze_stock(job.ticker, job)  # <-- replace with real logic
-                job.status = "succeeded"
+                item = await r.blpop(KEY_QUEUE_L, timeout=5)
+                if not item:
+                    await asyncio.sleep(0.1)
+                    continue
+                _, job_id = item
+
+                job = await read_job(job_id, r=r)
+                job.status = "running"
+                job.started_at = time.time()
+                await write_job(job, r=r)
+                await r.lrem(KEY_QUEUE_ORDER_L, 0, job_id)
+
+                # Acquire global lock (use worker's client!)
+                lock_id = uuid.uuid4().hex
+                got_lock = await r.set(KEY_CONCURRENCY_LOCK, lock_id, nx=True, px=CONCURRENCY_TTL_MS)
+                while not got_lock:
+                    await asyncio.sleep(0.5)
+                    got_lock = await r.set(KEY_CONCURRENCY_LOCK, lock_id, nx=True, px=CONCURRENCY_TTL_MS)
+
+                async def renew_lock():
+                    while True:
+                        await asyncio.sleep(10)
+                        if (await r.get(KEY_CONCURRENCY_LOCK)) != lock_id:
+                            break
+                        await r.pexpire(KEY_CONCURRENCY_LOCK, CONCURRENCY_TTL_MS)
+
+                renew_task = asyncio.create_task(renew_lock(), name=f"renew-lock-{job_id}")
+                try:
+                    job.result = await analyze_stock(job.ticker, job, r=r)  # pass r
+                    job.status = "succeeded"
+                except Exception as e:
+                    job.status = "failed"
+                    job.error = str(e)
+                finally:
+                    job.finished_at = time.time()
+                    await write_job(job, r=r)
+                    await save_job_to_db(job)
+                    renew_task.cancel()
+
+                    if (await r.get(KEY_CONCURRENCY_LOCK)) == lock_id:
+                        await r.delete(KEY_CONCURRENCY_LOCK)
+
+                    await r.delete(_ticker_key(job.ticker))
+                    await r.publish(_job_done_channel(job.id), "done")
             except Exception as e:
-                job.status = "failed"
-                job.error = str(e)
-            finally:
-                job.finished_at = time.time()
-                await write_job(job)
-                await save_job_to_db(job)  # persist durable history
-                renew_task.cancel()
+                print(e)
+                await asyncio.sleep(0.5)
+    finally:
+        await r.aclose()
 
-                # Release lock if we still own it
-                if (await redis.get(KEY_CONCURRENCY_LOCK)) == lock_id:
-                    await redis.delete(KEY_CONCURRENCY_LOCK)
-
-                # Clear active ticker + notify waiters
-                await redis.delete(_ticker_key(job.ticker))
-                await redis.publish(_job_done_channel(job.id), "done")
-        except Exception:
-            # keep the loop alive on transient errors
-            await asyncio.sleep(0.5)
+def start_worker_thread():
+    def _run():
+        # the worker gets its own event loop here
+        asyncio.run(worker_loop())
+    t = threading.Thread(target=_run, name="stock-worker", daemon=True)
+    t.start()
 
 # ---------------- The "long" task ----------------
-async def analyze_stock(ticker: str, job: Job, steps: int = 10) -> Dict[str, Any]:
+async def analyze_stock(ticker: str, job: Job, r: aioredis.Redis, steps: int = 10) -> Dict[str, Any]:
     """
     Simulate long work (set steps=300 for ~5 minutes).
     Replace this with your real I/O/CPU/ML pipeline.
@@ -398,21 +411,29 @@ async def analyze_stock(ticker: str, job: Job, steps: int = 10) -> Dict[str, Any
     }
     is_open = market_is_open(datetime.now().strftime("%Y-%m-%d"))
     if is_open:
+        print("processing for")
+        print(ticker)
+        print(current_date)
         state, decision = ta.propagate(ticker, current_date)
+        # deconstruct the messages
+        reports = {
+            "market_report": state['market_report'],
+            "news_report": state['news_report'],
+            "sentiment_report": state['sentiment_report'],
+            "fundamentals_report": state['fundamentals_report'],
+            "investment_plan": state['investment_plan'],
+            "trader_investment_plan": state['trader_investment_plan'],
+            "final_trade_decision": state['final_trade_decision'],
+            "investment_debate_state": state['investment_debate_state']
+        }
         result = {
             "decision": decision,
-            "detail": state,
+            "detail": reports,
             "market_open": True
         }
-    
-    await redis.expire(_ticker_key(ticker), 60 * 10)
-    
-    # for i in range(steps):
-    #     await asyncio.sleep(1)
-    #     job.progress = (i + 1) / steps
-    #     await write_job(job)
-    #     # keep ticker key alive while running
-    #     await redis.expire(_ticker_key(ticker), 60 * 10)
+    job.progress = 1.0
+    await write_job(job, r)
+    await r.expire(_ticker_key(ticker), 60 * 10)
 
     return {
         "ticker": ticker,
@@ -447,15 +468,15 @@ def market_is_open(date):
 # ---------------- Startup / Shutdown ----------------
 @app.on_event("startup")
 async def _startup():
-    global redis
-    redis = aioredis.from_url(REDIS_URL, decode_responses=True)
+    global redis_api
+    redis_api = aioredis.from_url(REDIS_URL, decode_responses=True)
     await init_db()
-    asyncio.create_task(worker_loop(), name="stock-worker-loop")
+    start_worker_thread()  # was: asyncio.create_task(worker_loop(), ...)
     asyncio.create_task(retention_loop(), name="history-retention-loop")
 
 @app.on_event("shutdown")
 async def _shutdown():
-    await redis.aclose()
+    await redis_api.aclose()
 
 # ---------------- Retention (SQLite) ----------------
 async def retention_loop():
@@ -480,12 +501,12 @@ async def analyze_endpoint(
     ticker_norm = ticker.upper().strip()
 
     # 1) If there's an active job, we keep the original behavior: single-flight join
-    active_job_id = await redis.get(_ticker_key(ticker_norm))
+    active_job_id = await redis_api.get(_ticker_key(ticker_norm))
     if active_job_id:
         # join the active job
         job = await read_job(active_job_id)
         if wait:
-            pubsub = redis.pubsub()
+            pubsub = redis_api.pubsub()
             await pubsub.subscribe(_job_done_channel(job.id))
             try:
                 while True:
@@ -527,7 +548,7 @@ async def analyze_endpoint(
             )
 
     # 3) Enqueue a fresh job (single-flight still enforced inside this call)
-    job = await enqueue_or_join(ticker_norm)
+    job = await enqueue_or_join(ticker_norm, redis_api)
 
     if wait:
         # Wait until this new job finishes
@@ -580,7 +601,7 @@ async def status(job_id: str):
 @app.get("/status-by-ticker/{ticker}", response_model=StatusResponse)
 async def status_by_ticker(ticker: str):
     ticker = ticker.upper().strip()
-    job_id = await redis.get(_ticker_key(ticker))
+    job_id = await redis_api.get(_ticker_key(ticker))
     if job_id:
         j = await read_job(job_id)
         s = await serialize_status(j)
@@ -618,7 +639,7 @@ async def status_by_ticker(ticker: str):
 @app.get("/history/latest", response_model=StatusResponse)
 async def history_latest(ticker: str = Query(..., description="Ticker symbol")):
     ticker = ticker.upper().strip()
-    job_id = await redis.get(_ticker_key(ticker))
+    job_id = await redis_api.get(_ticker_key(ticker))
     if job_id:
         j = await read_job(job_id)
         s = await serialize_status(j)
