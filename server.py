@@ -63,6 +63,15 @@ CONCURRENCY_TTL_MS = 30_000  # renew every ~10s while running
 # ---------------- App ----------------
 app = FastAPI(title="Stock Analyzer (Redis queued, single-flight, SQLite history)")
 
+from fastapi.middleware.cors import CORSMiddleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # ---------------- Models ----------------
 @dataclass
 class Job:

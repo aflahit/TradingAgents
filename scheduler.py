@@ -44,6 +44,7 @@ def job():
 # schedule.every().hour.do(job)
 schedule.every().day.at("20:30").do(job)
 
+print("start looping")
 while run:
     schedule.run_pending()
     time.sleep(1)
