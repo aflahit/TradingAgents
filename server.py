@@ -413,33 +413,33 @@ async def analyze_stock(ticker: str, job: Job, r: aioredis.Redis, steps: int = 1
     """
     current_date = datetime.today().strftime('%Y-%m-%d')
     # check for market open
-    result = {
-        "decision": "Nothing",
-        "detail": "Market is closed",
-        "market_open": False
+    # result = {
+    #     "decision": "Nothing",
+    #     "detail": "Market is closed",
+    #     "market_open": False
+    # }
+    # is_open = market_is_open(datetime.now().strftime("%Y-%m-%d"))
+    # if is_open:
+    print("processing for")
+    print(ticker)
+    print(current_date)
+    state, decision = ta.propagate(ticker, current_date)
+    # deconstruct the messages
+    reports = {
+        "market_report": state['market_report'],
+        "news_report": state['news_report'],
+        "sentiment_report": state['sentiment_report'],
+        "fundamentals_report": state['fundamentals_report'],
+        "investment_plan": state['investment_plan'],
+        "trader_investment_plan": state['trader_investment_plan'],
+        "final_trade_decision": state['final_trade_decision'],
+        "investment_debate_state": state['investment_debate_state']
     }
-    is_open = market_is_open(datetime.now().strftime("%Y-%m-%d"))
-    if is_open:
-        print("processing for")
-        print(ticker)
-        print(current_date)
-        state, decision = ta.propagate(ticker, current_date)
-        # deconstruct the messages
-        reports = {
-            "market_report": state['market_report'],
-            "news_report": state['news_report'],
-            "sentiment_report": state['sentiment_report'],
-            "fundamentals_report": state['fundamentals_report'],
-            "investment_plan": state['investment_plan'],
-            "trader_investment_plan": state['trader_investment_plan'],
-            "final_trade_decision": state['final_trade_decision'],
-            "investment_debate_state": state['investment_debate_state']
-        }
-        result = {
-            "decision": decision,
-            "detail": reports,
-            "market_open": True
-        }
+    result = {
+        "decision": decision,
+        "detail": reports,
+        "market_open": True
+    }
     job.progress = 1.0
     await write_job(job, r)
     await r.expire(_ticker_key(ticker), 60 * 10)
